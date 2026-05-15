@@ -1,0 +1,16 @@
+{
+  "Servers": {
+    "1": {
+      "Name": "Spotify ETL - PostgreSQL",
+      "Group": "Servers",
+      "Host": "postgres",
+      "Port": 5432,
+      "MaintenanceDB": "airflow",
+      "Username": "airflow",
+      "Password": "airflow_password",
+      "SSLMode": "prefer",
+      "PassFile": "",
+      "Favorite": true
+    }
+  }
+}

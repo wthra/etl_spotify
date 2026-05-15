@@ -1,0 +1,5 @@
+apache-airflow-providers-postgres>=5.0.0
+apache-airflow-providers-slack>=8.0.0
+dbt-postgres>=1.7.0
+pandas>=2.0.0
+psycopg2-binary>=2.9.0

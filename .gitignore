@@ -1,0 +1,44 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+*.egg-info/
+
+# ── Data files (large; not for version control) ───────────────────────────────
+data/raw_data/*.csv
+data/cleansed/*
+data/archive/*.csv
+data/rejected/*.csv
+data/staging/*
+
+# Keep directory placeholders
+!data/raw_data/.gitkeep
+!data/cleansed/.gitkeep
+!data/archive/.gitkeep
+!data/rejected/.gitkeep
+!data/staging/.gitkeep
+
+# ── dbt generated files ───────────────────────────────────────────────────────
+dbt_spotify/target/
+dbt_spotify/dbt_packages/
+dbt_spotify/.user.yml
+dbt_spotify/package-lock.yml
+
+# ── Airflow (log volume mounted into container) ───────────────────────────────
+logs/
+
+# ── Environment / secrets ─────────────────────────────────────────────────────
+.env
+*.env
+
+# ── Claude Code session files ─────────────────────────────────────────────────
+.claude/
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db

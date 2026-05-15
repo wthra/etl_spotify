@@ -1,0 +1,13 @@
+spotify:
+  target: dev
+  outputs:
+    dev:
+      type: postgres
+      host: postgres
+      port: 5432
+      user: airflow
+      password: airflow_password
+      dbname: airflow
+      schema: spotify
+      threads: 4
+      connect_timeout: 10

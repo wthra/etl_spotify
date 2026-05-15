@@ -1,0 +1,8 @@
+version: 2
+
+sources:
+  - name: spotify_raw
+    schema: spotify
+    tables:
+      - name: stg_spotify_tracks
+        description: "Raw staging table loaded by Airflow Task 2 (TRUNCATE + COPY)"

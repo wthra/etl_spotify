@@ -1,0 +1,130 @@
+x-airflow-common: &airflow-common
+  build: .
+  image: spotify-airflow:latest
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+    AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+    AIRFLOW__CORE__PLUGINS_FOLDER: /opt/airflow/plugins
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow_password@postgres:5432/airflow
+    AIRFLOW__CORE__FERNET_KEY: ${FERNET_KEY:-qQnUJo5y-79_tH8h8-6NVeIDJzEJkkI5YBF4K4p8hI8=}
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${SECRET_KEY:-spotify_etl_secret_2026}
+    AIRFLOW__LOGGING__LOGGING_LEVEL: INFO
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./plugins:/opt/airflow/plugins
+    - ./data:/opt/airflow/data
+    - ./scripts:/opt/airflow/scripts
+    - ./dbt_spotify:/opt/airflow/dbt_spotify
+    - airflow_logs:/opt/airflow/logs
+  networks:
+    - spotify_network
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+services:
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:15
+    container_name: spotify_postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow_password
+      POSTGRES_DB: airflow
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - spotify_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Airflow DB Init (one-shot, no custom entrypoint) ───────────────────────
+  airflow-init:
+    <<: *airflow-common
+    container_name: spotify_airflow_init
+    command:
+      - bash
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username admin --firstname Admin --lastname User \
+          --role Admin --email admin@spotify-etl.local --password admin \
+          2>/dev/null || true
+        airflow connections add postgres_default \
+          --conn-type postgres --conn-host postgres \
+          --conn-login airflow --conn-password airflow_password \
+          --conn-port 5432 --conn-schema airflow \
+          2>/dev/null || true
+        airflow variables set spotify_db_conn_id postgres_default 2>/dev/null || true
+        airflow variables set spotify_date_format "%Y-%m-%d" 2>/dev/null || true
+        echo "Init complete"
+    restart: "no"
+
+  # ── Airflow Webserver ───────────────────────────────────────────────────────
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: spotify_airflow_web
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    ports:
+      - "8080:8080"
+    command: airflow webserver
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+
+  # ── Airflow Scheduler ───────────────────────────────────────────────────────
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: spotify_airflow_scheduler
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    command: airflow scheduler
+    restart: unless-stopped
+
+  # ── pgAdmin (SQL query UI for presentation) ─────────────────────────────────
+  pgadmin:
+    image: dpage/pgadmin4:8
+    container_name: spotify_pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@spotify.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+      PGADMIN_SERVER_JSON_FILE: /pgadmin4/servers.json
+    ports:
+      - "5051:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+      - ./pgadmin_servers.json:/pgadmin4/servers.json:ro
+    networks:
+      - spotify_network
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  airflow_logs:
+  pgadmin_data:
+
+networks:
+  spotify_network:
+    driver: bridge

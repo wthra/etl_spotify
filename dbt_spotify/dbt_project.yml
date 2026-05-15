@@ -1,0 +1,28 @@
+name: dbt_spotify
+version: '1.0.0'
+config-version: 2
+
+profile: spotify
+
+model-paths: ["models"]
+seed-paths: ["seeds"]
+test-paths: ["tests"]
+macro-paths: ["macros"]
+
+target-path: "target"
+clean-targets: ["target", "dbt_packages"]
+
+models:
+  dbt_spotify:
+    staging:
+      +schema: spotify
+      +materialized: view
+    dimensions:
+      +schema: spotify
+      +materialized: table
+    facts:
+      +schema: spotify
+      +materialized: table
+    marts:
+      +schema: spotify_marts
+      +materialized: table
