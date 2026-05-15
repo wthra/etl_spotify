@@ -1,45 +1,46 @@
 # Spotify ETL Pipeline
 
-End-to-end batch ETL pipeline ingesting 85,000 Spotify track records through a validated Bronze → Silver → Gold data lakehouse architecture, orchestrated by Apache Airflow and transformed via dbt into a star schema and pre-aggregated gold marts.
+โปรเจกต์ ETL แบบ Batch สำหรับนำเข้าข้อมูลเพลง Spotify 85,000 รายการ ผ่านสถาปัตยกรรม Bronze → Silver → Gold โดยใช้ Apache Airflow ในการ orchestrate และ dbt ในการแปลงข้อมูลเป็น Star Schema และ Gold Mart ที่พร้อมใช้งานสำหรับนักวิเคราะห์ข้อมูล
 
 **Stack:** Apache Airflow 2.8.1 · PostgreSQL 15 · dbt-postgres 1.7.14 · Docker Compose
 
 ---
 
-## Data Architecture
+## สถาปัตยกรรมข้อมูล (Data Architecture)
 
 ```
 +-------------------------------------------------------------------------------------------+
 |  LANDING                                                                                  |
 |  data/raw_data/spotify_2015_2025_85k.csv                                                  |
-|  Raw CSV drop zone — file untouched, never modified by pipeline                           |
+|  โซนรับไฟล์ดิบ — ไฟล์ต้นฉบับไม่ถูกแตะต้องหรือแก้ไขโดย pipeline                              |
 +-------------------------------------------------------------------------------------------+
                                         |
                     +-----------------------------------------+
                     |                                         |
                     v                                         v
 +-------------------------------+             +-------------------------------+
-|  BRONZE                       |             |  DEAD LETTER QUEUE            |
+|  BRONZE                       |             |  DEAD LETTER QUEUE (DLQ)      |
 |  data/cleansed/               |             |  data/rejected/               |
-|  Validated rows only          |             |  Failed validation rows +     |
-|  Normalized dates (ISO 8601)  |             |  error_reason column for      |
-|  Temp file — deleted post-run |             |  manual review and replay     |
+|  เฉพาะแถวที่ผ่านการตรวจสอบ    |             |  แถวที่ไม่ผ่าน + คอลัมน์      |
+|  วันที่ถูก normalize ให้       |             |  error_reason สำหรับตรวจสอบ  |
+|  เป็น ISO 8601 ทั้งหมด        |             |  และนำกลับมา replay ใหม่      |
+|  ไฟล์ชั่วคราว — ลบหลัง run   |             |                               |
 +-------------------------------+             +-------------------------------+
                 |
                 v
 +-------------------------------------------------------------------------------------------+
 |  STAGING  (PostgreSQL — schema: spotify)                                                  |
 |  spotify.stg_spotify_tracks                                                               |
-|  Full-refresh table: TRUNCATE + COPY from Bronze CSV on every run                        |
+|  ตาราง buffer สำหรับโหลดข้อมูล: TRUNCATE ก่อน แล้ว COPY จาก Bronze CSV ทุก run           |
 +-------------------------------------------------------------------------------------------+
                 |
                 v
 +-------------------------------------------------------------------------------------------+
-|  SILVER  (PostgreSQL — schema: spotify, materialized as dbt tables)                       |
+|  SILVER  (PostgreSQL — schema: spotify, สร้างโดย dbt เป็น materialized table)             |
 |                                                                                           |
 |  +------------------+     +------------------+     +---------------------------+          |
 |  |   dim_artist     |     |   dim_album      |     |   fact_streams            |          |
-|  |  62,391 rows     |     |  84,980 rows     |     |  85,000 rows              |          |
+|  |  62,391 แถว      |     |  84,980 แถว      |     |  85,000 แถว               |          |
 |  |  PK: artist_id   |     |  PK: album_id    |     |  PK: stream_id            |          |
 |  |  (surrogate MD5) |     |  (surrogate MD5) |     |  FK: artist_id, album_id  |          |
 |  +------------------+     +------------------+     |  Grain: track x country   |          |
@@ -48,137 +49,150 @@ End-to-end batch ETL pipeline ingesting 85,000 Spotify track records through a v
                 |
                 v
 +-------------------------------------------------------------------------------------------+
-|  GOLD  (PostgreSQL — schema: spotify_marts, materialized as dbt tables)                   |
+|  GOLD  (PostgreSQL — schema: spotify_marts, สร้างโดย dbt เป็น materialized table)         |
 |                                                                                           |
 |  +------------------------------------+  +------------------------------------------+    |
 |  |  daily_top_artists                 |  |  monthly_genre_trends                    |    |
-|  |  Artists ranked by stream_count    |  |  Genre rollup with MoM growth %          |    |
-|  |  per release_date using RANK()     |  |  and market share using LAG() + window   |    |
+|  |  จัดอันดับศิลปินตาม stream_count   |  |  สรุปแนวเพลงรายเดือน + MoM growth %     |    |
+|  |  แต่ละวัน โดยใช้ RANK()            |  |  และ market share โดยใช้ LAG() + window  |    |
 |  +------------------------------------+  +------------------------------------------+    |
 +-------------------------------------------------------------------------------------------+
 ```
 
 ---
 
-## ETL Pipeline — Task Breakdown
+## Operator ที่ใช้ใน Airflow
 
-The DAG (`spotify_daily_etl_pipeline`) runs daily at 02:00 UTC with a linear dependency chain:
+Airflow มี Operator หลายประเภทสำหรับงานที่ต่างกัน โปรเจกต์นี้ใช้ 2 ประเภทหลัก:
+
+### PythonOperator
+
+**หลักการทำงาน:** รันฟังก์ชัน Python ใดก็ได้ที่กำหนดไว้ภายใน DAG โดยตรง Airflow จะ pass `context` dictionary เข้าไปในฟังก์ชัน ทำให้เข้าถึง metadata ของ run เช่น run date, task instance, XCom ได้
+
+**ใช้กับ data อย่างไร:**
+- อ่านและเขียนไฟล์ CSV ผ่าน Python standard library (`csv.DictReader`, `csv.DictWriter`)
+- เชื่อมต่อ PostgreSQL ผ่าน `PostgresHook` แล้วใช้ `cursor.copy_expert()` สำหรับ bulk load
+- ส่งผลลัพธ์ระหว่าง task ผ่าน XCom (`ti.xcom_push` / `ti.xcom_pull`)
+- จัดการไฟล์ระบบ เช่น ย้ายไฟล์, ลบไฟล์ผ่าน `shutil` และ `pathlib`
+
+**เลือกใช้เมื่อ:** logic ต้องการการตัดสินใจหลายเงื่อนไข (if/else), วนลูป, แปลง type, หรือใช้ Python library ที่ SQL และ Bash ทำไม่ได้
+
+**ใช้ใน Task:** 1, 2, 3, 6
+
+---
+
+### BashOperator
+
+**หลักการทำงาน:** รัน shell command ภายใน Airflow container โดยตรง เหมาะสำหรับเรียกใช้ CLI tool ที่ติดตั้งไว้ในระบบ
+
+**ใช้กับ data อย่างไร:**
+- เรียก `dbt run` ซึ่งเป็น CLI ที่อ่าน SQL model files, compile เป็น query, แล้วรันกับ PostgreSQL
+- dbt เชื่อมต่อกับฐานข้อมูลผ่าน `profiles.yml` และสร้าง table ใน schema ที่กำหนด
+- ผลลัพธ์คือตารางใหม่ใน PostgreSQL (dim_artist, dim_album, fact_streams, daily_top_artists, monthly_genre_trends)
+- BashOperator จะ fail task ทันทีถ้า dbt คืน exit code ที่ไม่ใช่ 0 ทำให้ pipeline หยุดอัตโนมัติ
+
+**เลือกใช้เมื่อ:** ต้องการรัน external CLI tool ที่ติดตั้งไว้ใน container อยู่แล้ว ไม่มี native Airflow operator รองรับ
+
+**ใช้ใน Task:** 4, 5
+
+---
+
+## รายละเอียด Task ทั้ง 6
+
+DAG `spotify_daily_etl_pipeline` รันทุกวันเวลา 02:00 UTC ด้วย dependency แบบเส้นตรง:
 
 ```
 Task 1 → Task 2 → Task 3 → Task 4 → Task 5 → Task 6
 ```
 
-### Task 1 — extract_and_validate_data
+### Task 1 — extract_and_validate_data (PythonOperator)
 
-**Operator:** `PythonOperator`
+อ่านไฟล์ CSV จาก `data/raw_data/` ตรวจสอบทุกแถวด้วย 15 กฎ แถวที่ผ่านเขียนไปที่ `data/cleansed/` แถวที่ไม่ผ่านเขียนไปที่ `data/rejected/` พร้อมคอลัมน์ `error_reason`
 
-**Why PythonOperator:** Validation logic requires row-by-row iteration with conditional branching, multi-format date parsing, and type coercion — none of which are expressible in SQL or a simple Bash command.
+กฎที่ตรวจสอบ:
 
-**What it does:**
-Reads the raw CSV from `data/raw_data/`, applies 16 validation rules to every row, writes passing rows to `data/cleansed/spotify_cleansed.csv` and failing rows (with an `error_reason` column) to `data/rejected/spotify_rejected.csv`.
-
-**Validation rules applied:**
-
-| Field | Rule |
+| Field | เงื่อนไข |
 |---|---|
-| track_id | Not null, not empty string |
-| track_name | Not null, not empty string |
-| artist_name | Not null, not empty string |
-| release_date | Parseable in 5 formats; normalized to YYYY-MM-DD; not in future; year >= 1900 |
-| duration_ms | Numeric and > 0 |
-| popularity | Numeric and in range 0–100 |
-| danceability | Numeric and in range 0.0–1.0 |
-| energy | Numeric and in range 0.0–1.0 |
-| instrumentalness | Numeric and in range 0.0–1.0 |
-| loudness | Numeric and in range -60.0 to 0.0 dBFS |
-| tempo | Numeric and > 0 |
-| key | Integer in range 0–11 |
-| mode | Integer 0 or 1 |
-| stream_count | Numeric and >= 0 |
-| explicit | One of: 0, 1, true, false |
+| track_id | ห้าม null หรือว่างเปล่า |
+| track_name | ห้าม null หรือว่างเปล่า |
+| artist_name | ห้าม null หรือว่างเปล่า |
+| release_date | รองรับ 5 format, normalize เป็น YYYY-MM-DD, ห้ามเป็นวันในอนาคต, ปี >= 1900 |
+| duration_ms | ต้องเป็นตัวเลขและ > 0 |
+| popularity | ต้องเป็นตัวเลขในช่วง 0–100 |
+| danceability | ต้องเป็นตัวเลขในช่วง 0.0–1.0 |
+| energy | ต้องเป็นตัวเลขในช่วง 0.0–1.0 |
+| instrumentalness | ต้องเป็นตัวเลขในช่วง 0.0–1.0 |
+| loudness | ต้องเป็นตัวเลขในช่วง -60.0 ถึง 0.0 dBFS |
+| tempo | ต้องเป็นตัวเลขและ > 0 |
+| key | ต้องเป็น integer ในช่วง 0–11 |
+| mode | ต้องเป็น 0 หรือ 1 เท่านั้น |
+| stream_count | ต้องเป็นตัวเลขและ >= 0 |
+| explicit | ต้องเป็นหนึ่งใน: 0, 1, true, false |
 
-Row counts are pushed to XCom for cross-task assertion in Task 3.
-
----
-
-### Task 2 — load_cleansed_to_staging
-
-**Operator:** `PythonOperator`
-
-**Why PythonOperator:** Uses `psycopg2` cursor's `copy_expert()` method to issue a PostgreSQL `COPY ... FROM STDIN` command. This bypasses row-by-row INSERT overhead and loads 85k rows in under 2 seconds. The `TRUNCATE` before `COPY` guarantees idempotency — re-running the DAG on the same day always produces the same staging state.
-
-**What it does:**
-1. Creates `spotify` schema and `stg_spotify_tracks` table if they do not exist
-2. Truncates the table (full refresh)
-3. Bulk-loads `spotify_cleansed.csv` via `COPY ... FROM STDIN WITH (FORMAT CSV, HEADER TRUE)`
-4. Pushes loaded row count to XCom
+จำนวนแถวที่ผ่านถูก push ไปยัง XCom เพื่อใช้ตรวจสอบใน Task 3
 
 ---
 
-### Task 3 — data_quality_check
+### Task 2 — load_cleansed_to_staging (PythonOperator)
 
-**Operator:** `PythonOperator`
+รับไฟล์จาก Bronze layer แล้วโหลดเข้า PostgreSQL โดยใช้คำสั่ง `COPY` ซึ่งเร็วกว่า INSERT ธรรมดามากสำหรับข้อมูลจำนวนมาก
 
-**Why PythonOperator:** SQL checks are executed via `PostgresHook`, and the results are compared against expected values (including the XCom value from Task 1). A Python exception raised here halts the entire pipeline before any dbt models run, ensuring no bad data reaches the star schema.
+ขั้นตอน:
+1. สร้าง schema `spotify` และตาราง `stg_spotify_tracks` ถ้ายังไม่มี
+2. `TRUNCATE` ตารางทิ้ง (full refresh ทุก run เพื่อ idempotency)
+3. โหลด CSV ด้วย `COPY ... FROM STDIN WITH (FORMAT CSV, HEADER TRUE)` ผ่าน `cursor.copy_expert()`
+4. Push จำนวนแถวที่โหลดไปยัง XCom
 
-**What it does:**
-Runs 6 SQL assertions against `stg_spotify_tracks`:
+---
 
-| Check | Expected |
+### Task 3 — data_quality_check (PythonOperator)
+
+รัน 6 SQL assertion เพื่อตรวจสอบคุณภาพข้อมูลใน staging table ก่อนที่ dbt จะทำงาน ถ้าเช็คใดไม่ผ่านจะ raise `ValueError` ทำให้ pipeline หยุดทันที
+
+| การตรวจสอบ | ค่าที่คาดหวัง |
 |---|---|
-| NULL track_ids | 0 |
-| Duplicate track_ids | 0 |
-| Rows with duration_ms <= 0 | 0 |
-| Rows with popularity outside 0–100 | 0 |
-| Rows with danceability outside 0–1 | 0 |
-| Row count matches Task 1 valid count | Exact match |
+| track_id ที่เป็น NULL | 0 |
+| track_id ที่ซ้ำกัน | 0 |
+| แถวที่มี duration_ms <= 0 | 0 |
+| แถวที่มี popularity นอกช่วง 0–100 | 0 |
+| แถวที่มี danceability นอกช่วง 0–1 | 0 |
+| จำนวนแถวตรงกับ Task 1 (cross-task assertion) | ต้องเท่ากันพอดี |
 
-The final row count check is a cross-task assertion: it pulls the valid row count from Task 1 via XCom and confirms that exactly that many rows landed in PostgreSQL. This detects silent drops from encoding errors or COPY failures.
-
----
-
-### Task 4 — transform_to_star_schema
-
-**Operator:** `BashOperator`
-
-**Why BashOperator:** dbt is a CLI tool. BashOperator runs `dbt deps && dbt run` as a subprocess inside the Airflow container where dbt is pre-installed. There is no native Airflow dbt operator that runs faster or provides more control for this use case.
-
-**What it does:**
-Runs `dbt run --select +fact_streams` which builds models in dependency order:
-1. `stg_tracks_typed` (view over staging table — typed casts + derived columns)
-2. `dim_artist` (62,391 unique artists with MD5 surrogate key)
-3. `dim_album` (84,980 unique albums deduplicated via `DISTINCT ON`)
-4. `fact_streams` (85,000 rows at grain: track × country, with 4 btree indexes)
-
-The `+` prefix in the select expression instructs dbt to include all upstream models automatically.
+การตรวจสอบสุดท้ายดึงค่าจาก XCom ของ Task 1 มาเปรียบเทียบกับจำนวนแถวใน PostgreSQL เพื่อตรวจจับการสูญหายของข้อมูลระหว่างขั้นตอน CSV → Database
 
 ---
 
-### Task 5 — create_data_marts
+### Task 4 — transform_to_star_schema (BashOperator)
 
-**Operator:** `BashOperator`
+รัน `dbt run --select +fact_streams` ซึ่ง dbt จะสร้าง model ตามลำดับ dependency:
 
-**Why BashOperator:** Same reason as Task 4 — dbt CLI invocation.
+1. `stg_tracks_typed` — view ที่ cast type และเพิ่มคอลัมน์ derived เช่น `duration_min`, `release_month`
+2. `dim_artist` — 62,391 artist ไม่ซ้ำ พร้อม surrogate key จาก MD5 hash
+3. `dim_album` — 84,980 album ไม่ซ้ำ deduplicate ด้วย `DISTINCT ON (album_name, artist_name)`
+4. `fact_streams` — 85,000 แถว grain คือ track × country มี 4 btree index สำหรับ query performance
 
-**What it does:**
-Runs `dbt run --select +daily_top_artists +monthly_genre_trends` which builds:
-1. `daily_top_artists` — artists ranked per `release_date` using `RANK() OVER (PARTITION BY release_date ORDER BY total_streams DESC)`
-2. `monthly_genre_trends` — genre streams rolled up by month with `LAG()` for MoM growth and a window-sum for genre share percentage
+เครื่องหมาย `+` หน้าชื่อ model หมายถึงให้ dbt รัน upstream model ทั้งหมดโดยอัตโนมัติ
 
 ---
 
-### Task 6 — archive_and_cleanup
+### Task 5 — create_data_marts (BashOperator)
 
-**Operator:** `PythonOperator`
+รัน `dbt run --select +daily_top_artists +monthly_genre_trends` เพื่อสร้าง Gold layer:
 
-**Why PythonOperator:** File system operations (`shutil.move`, `Path.unlink`) and run-date-aware naming (`context["ds_nodash"]`) require Python. The archive filename encodes the run date for traceability.
+1. `daily_top_artists` — สรุปยอด stream รายวันต่อศิลปิน จัดอันดับด้วย `RANK() OVER (PARTITION BY release_date ORDER BY total_streams DESC)`
+2. `monthly_genre_trends` — สรุปแนวเพลงรายเดือน คำนวณ MoM growth ด้วย `LAG()` และ genre share ด้วย window sum
 
-**What it does:**
-1. Moves the source CSV from `data/raw_data/` to `data/archive/spotify_processed_YYYYMMDD.csv`
-2. Deletes `data/cleansed/spotify_cleansed.csv` (temp file)
-3. Preserves `data/rejected/spotify_rejected.csv` for operator review
+---
 
-**Failure alerting:** Every task has `on_failure_callback` wired to a Slack webhook. If any task fails, Slack receives the DAG name, task name, run ID, and a direct log URL.
+### Task 6 — archive_and_cleanup (PythonOperator)
+
+จัดการไฟล์หลัง pipeline เสร็จสิ้น:
+
+1. ย้ายไฟล์ต้นฉบับจาก `data/raw_data/` ไปที่ `data/archive/spotify_processed_YYYYMMDD.csv` (ชื่อไฟล์มี run date)
+2. ลบไฟล์ชั่วคราว `data/cleansed/spotify_cleansed.csv`
+3. เก็บ `data/rejected/spotify_rejected.csv` ไว้สำหรับ operator ตรวจสอบ
+
+**การแจ้งเตือนเมื่อเกิด error:** ทุก task มี `on_failure_callback` เชื่อมกับ Slack webhook ถ้า task ใดล้มเหลวจะส่ง alert พร้อมชื่อ DAG, ชื่อ task, run ID และลิงก์ log ทันที
 
 ---
 
@@ -186,152 +200,152 @@ Runs `dbt run --select +daily_top_artists +monthly_genre_trends` which builds:
 
 ### spotify.stg_spotify_tracks (Staging)
 
-Raw data as loaded — no transformation, no surrogate keys.
+ข้อมูลดิบที่โหลดเข้ามา ยังไม่มี transformation หรือ surrogate key
 
-| Column | Type | Description |
+| คอลัมน์ | ประเภท | คำอธิบาย |
 |---|---|---|
 | track_id | TEXT | Spotify track identifier (natural key) |
-| track_name | TEXT | Track title |
-| artist_name | TEXT | Primary artist name |
-| album_name | TEXT | Album title |
-| release_date | DATE | Release date, normalized to ISO 8601 |
-| genre | TEXT | Music genre tag |
-| duration_ms | BIGINT | Track length in milliseconds |
-| popularity | SMALLINT | Spotify popularity score (0–100) |
-| danceability | NUMERIC(5,3) | Danceability score (0.0–1.0) |
-| energy | NUMERIC(5,3) | Energy score (0.0–1.0) |
-| key | SMALLINT | Musical key (0=C, 1=C#, ..., 11=B) |
-| loudness | NUMERIC(6,2) | Average loudness in dBFS (-60 to 0) |
-| mode | SMALLINT | Modality (0=minor, 1=major) |
-| instrumentalness | NUMERIC(7,4) | Instrumental probability (0.0–1.0) |
-| tempo | NUMERIC(7,2) | Beats per minute |
-| stream_count | BIGINT | Cumulative stream count |
-| country | TEXT | Market country code |
-| explicit | BOOLEAN | Whether track has explicit content |
-| label | TEXT | Record label |
-| _loaded_at | TIMESTAMPTZ | Timestamp of COPY load |
+| track_name | TEXT | ชื่อเพลง |
+| artist_name | TEXT | ชื่อศิลปินหลัก |
+| album_name | TEXT | ชื่ออัลบั้ม |
+| release_date | DATE | วันที่วางจำหน่าย normalize แล้วเป็น ISO 8601 |
+| genre | TEXT | แนวเพลง |
+| duration_ms | BIGINT | ความยาวเพลงหน่วยมิลลิวินาที |
+| popularity | SMALLINT | คะแนนความนิยม Spotify (0–100) |
+| danceability | NUMERIC(5,3) | ความสามารถในการเต้น (0.0–1.0) |
+| energy | NUMERIC(5,3) | ระดับพลังงานของเพลง (0.0–1.0) |
+| key | SMALLINT | คีย์ดนตรี (0=C, 1=C#, ..., 11=B) |
+| loudness | NUMERIC(6,2) | ความดังเฉลี่ย dBFS (-60 ถึง 0) |
+| mode | SMALLINT | โหมดดนตรี (0=minor, 1=major) |
+| instrumentalness | NUMERIC(7,4) | ความน่าจะเป็นที่เป็นเพลงบรรเลง (0.0–1.0) |
+| tempo | NUMERIC(7,2) | จังหวะ beats per minute |
+| stream_count | BIGINT | จำนวนการสตรีมสะสม |
+| country | TEXT | รหัสประเทศตลาด |
+| explicit | BOOLEAN | มีเนื้อหาผู้ใหญ่หรือไม่ |
+| label | TEXT | ค่ายเพลง |
+| _loaded_at | TIMESTAMPTZ | เวลาที่โหลดเข้าผ่าน COPY |
 
 ---
 
 ### spotify.dim_artist (Silver)
 
-One row per unique artist. SCD Type 1 — latest values overwrite on each run.
+หนึ่งแถวต่อหนึ่งศิลปินไม่ซ้ำ SCD Type 1 — ค่าล่าสุดทับของเก่าทุก run
 
-| Column | Type | Description |
+| คอลัมน์ | ประเภท | คำอธิบาย |
 |---|---|---|
-| artist_id | TEXT | Surrogate key — MD5 hash of artist_name |
-| artist_name | TEXT | Artist name (natural key) |
-| updated_at | TIMESTAMPTZ | Timestamp of last dbt run |
+| artist_id | TEXT | Surrogate key — MD5 hash ของ artist_name |
+| artist_name | TEXT | ชื่อศิลปิน (natural key) |
+| updated_at | TIMESTAMPTZ | เวลา dbt run ล่าสุด |
 
 ---
 
 ### spotify.dim_album (Silver)
 
-One row per unique (album_name, artist_name) combination. Deduplication uses `DISTINCT ON` ordered by `release_date` to resolve conflicts when the same album appears with different labels or genres across tracks.
+หนึ่งแถวต่อคู่ (album_name, artist_name) ไม่ซ้ำ ใช้ `DISTINCT ON` เพื่อแก้ปัญหาอัลบั้มเดียวกันที่มี label หรือ genre ต่างกันในข้อมูลต้นฉบับ
 
-| Column | Type | Description |
+| คอลัมน์ | ประเภท | คำอธิบาย |
 |---|---|---|
-| album_id | TEXT | Surrogate key — MD5 hash of album_name + artist_name |
-| artist_id | TEXT | FK to dim_artist |
-| album_name | TEXT | Album title |
-| artist_name | TEXT | Artist name |
-| label | TEXT | Record label |
-| genre | TEXT | Genre tag |
-| release_date | DATE | Album release date |
-| release_year | INT | Derived from release_date |
-| updated_at | TIMESTAMPTZ | Timestamp of last dbt run |
+| album_id | TEXT | Surrogate key — MD5 hash ของ album_name + artist_name |
+| artist_id | TEXT | FK ไปยัง dim_artist |
+| album_name | TEXT | ชื่ออัลบั้ม |
+| artist_name | TEXT | ชื่อศิลปิน |
+| label | TEXT | ค่ายเพลง |
+| genre | TEXT | แนวเพลง |
+| release_date | DATE | วันที่วางจำหน่ายอัลบั้ม |
+| release_year | INT | ปีที่วางจำหน่าย (derived จาก release_date) |
+| updated_at | TIMESTAMPTZ | เวลา dbt run ล่าสุด |
 
 ---
 
 ### spotify.fact_streams (Silver)
 
-Grain: one row per (track_id, country). Measures are additive. Four btree indexes support efficient filtering by date, artist, and album.
+Grain: หนึ่งแถวต่อ (track_id, country) measure ทุกตัวเป็น additive มี 4 btree index สำหรับ filter ตาม date, artist, album
 
-| Column | Type | Description |
+| คอลัมน์ | ประเภท | คำอธิบาย |
 |---|---|---|
-| stream_id | TEXT | Surrogate PK — MD5 hash of track_id + country |
-| track_id | TEXT | Natural key from source |
-| artist_id | TEXT | FK to dim_artist |
-| album_id | TEXT | FK to dim_album |
-| track_name | TEXT | Track title |
-| country | TEXT | Market country code |
-| genre | TEXT | Genre tag |
-| explicit | BOOLEAN | Explicit content flag |
+| stream_id | TEXT | Surrogate PK — MD5 hash ของ track_id + country |
+| track_id | TEXT | Natural key จาก source |
+| artist_id | TEXT | FK ไปยัง dim_artist |
+| album_id | TEXT | FK ไปยัง dim_album |
+| track_name | TEXT | ชื่อเพลง |
+| country | TEXT | รหัสประเทศตลาด |
+| genre | TEXT | แนวเพลง |
+| explicit | BOOLEAN | มีเนื้อหาผู้ใหญ่หรือไม่ |
 | danceability | NUMERIC(5,3) | Audio feature (0.0–1.0) |
 | energy | NUMERIC(5,3) | Audio feature (0.0–1.0) |
-| key | SMALLINT | Musical key (0–11) |
-| loudness | NUMERIC(6,2) | Average loudness in dBFS |
-| mode | SMALLINT | Modality (0=minor, 1=major) |
-| instrumentalness | NUMERIC(7,4) | Instrumental probability |
+| key | SMALLINT | คีย์ดนตรี (0–11) |
+| loudness | NUMERIC(6,2) | ความดังเฉลี่ย dBFS |
+| mode | SMALLINT | โหมดดนตรี (0=minor, 1=major) |
+| instrumentalness | NUMERIC(7,4) | ความน่าจะเป็นที่เป็นเพลงบรรเลง |
 | tempo | NUMERIC(7,2) | Beats per minute |
-| duration_ms | BIGINT | Track length in milliseconds |
-| duration_min | NUMERIC | Track length in minutes (derived) |
-| popularity | SMALLINT | Spotify popularity score (0–100) |
-| stream_count | BIGINT | Cumulative stream count |
-| release_date | DATE | Used as partition key for range filters |
-| release_month | DATE | First day of release month (for monthly rollups) |
-| release_year | INT | Release year |
-| loaded_at | TIMESTAMPTZ | Timestamp of dbt run |
+| duration_ms | BIGINT | ความยาวเพลงหน่วยมิลลิวินาที |
+| duration_min | NUMERIC | ความยาวเพลงหน่วยนาที (derived) |
+| popularity | SMALLINT | คะแนนความนิยม (0–100) |
+| stream_count | BIGINT | จำนวนการสตรีมสะสม |
+| release_date | DATE | ใช้เป็น partition key สำหรับ filter ตาม date range |
+| release_month | DATE | วันแรกของเดือน (สำหรับ monthly rollup) |
+| release_year | INT | ปีที่วางจำหน่าย |
+| loaded_at | TIMESTAMPTZ | เวลา dbt run |
 
 ---
 
 ### spotify_marts.daily_top_artists (Gold)
 
-Artists ranked by total stream count per release date. Pre-aggregated — no joins required by consumers.
+จัดอันดับศิลปินตามยอด stream รายวัน pre-aggregated ไม่ต้อง join เพิ่มเติม
 
-| Column | Type | Description |
+| คอลัมน์ | ประเภท | คำอธิบาย |
 |---|---|---|
-| release_date | DATE | Date of streams |
-| artist_name | TEXT | Artist name |
-| artist_id | TEXT | FK to dim_artist |
-| total_streams | NUMERIC | Sum of stream_count for this artist on this date |
-| avg_popularity | NUMERIC(5,2) | Average popularity across tracks |
-| track_count | BIGINT | Number of distinct tracks |
-| country_reach | BIGINT | Number of distinct markets |
-| rank_by_streams | BIGINT | Rank within date partition (1 = most streamed) |
+| release_date | DATE | วันที่ |
+| artist_name | TEXT | ชื่อศิลปิน |
+| artist_id | TEXT | FK ไปยัง dim_artist |
+| total_streams | NUMERIC | รวม stream_count ของศิลปินในวันนั้น |
+| avg_popularity | NUMERIC(5,2) | ค่าเฉลี่ย popularity ของเพลงทั้งหมด |
+| track_count | BIGINT | จำนวนเพลงที่แตกต่างกัน |
+| country_reach | BIGINT | จำนวนประเทศที่มีการสตรีม |
+| rank_by_streams | BIGINT | อันดับภายในวัน (1 = สตรีมมากที่สุด) |
 
 ---
 
 ### spotify_marts.monthly_genre_trends (Gold)
 
-Genre performance aggregated by month. Includes month-over-month growth and market share for trend analysis.
+สรุปประสิทธิภาพแนวเพลงรายเดือน รวม MoM growth และ market share สำหรับการวิเคราะห์แนวโน้ม
 
-| Column | Type | Description |
+| คอลัมน์ | ประเภท | คำอธิบาย |
 |---|---|---|
-| release_month | DATE | First day of the calendar month |
-| release_year | INT | Year |
-| genre | TEXT | Genre tag |
-| total_streams | NUMERIC | Total streams this genre this month |
-| avg_popularity | NUMERIC(5,2) | Average track popularity |
-| avg_danceability | NUMERIC(5,3) | Average danceability score |
-| avg_energy | NUMERIC(5,3) | Average energy score |
-| avg_tempo | NUMERIC(7,2) | Average tempo (BPM) |
-| unique_tracks | BIGINT | Distinct track count |
-| unique_artists | BIGINT | Distinct artist count |
-| market_reach | BIGINT | Distinct country count |
-| genre_share_pct | NUMERIC | Share of total monthly streams (sums to 1.0 per month) |
-| prev_month_streams | NUMERIC | Previous month's stream count (LAG) |
-| mom_growth_pct | NUMERIC | Month-over-month growth rate (%) |
+| release_month | DATE | วันแรกของเดือน |
+| release_year | INT | ปี |
+| genre | TEXT | แนวเพลง |
+| total_streams | NUMERIC | รวม stream ของแนวเพลงนี้ในเดือนนี้ |
+| avg_popularity | NUMERIC(5,2) | ค่าเฉลี่ย popularity |
+| avg_danceability | NUMERIC(5,3) | ค่าเฉลี่ย danceability |
+| avg_energy | NUMERIC(5,3) | ค่าเฉลี่ย energy |
+| avg_tempo | NUMERIC(7,2) | ค่าเฉลี่ย tempo (BPM) |
+| unique_tracks | BIGINT | จำนวนเพลงที่แตกต่างกัน |
+| unique_artists | BIGINT | จำนวนศิลปินที่แตกต่างกัน |
+| market_reach | BIGINT | จำนวนประเทศที่มีการสตรีม |
+| genre_share_pct | NUMERIC | สัดส่วน stream ต่อ stream รวมทั้งเดือน (รวมกันได้ 1.0 ต่อเดือน) |
+| prev_month_streams | NUMERIC | ยอด stream เดือนก่อนหน้า (LAG) |
+| mom_growth_pct | NUMERIC | อัตราการเติบโต month-over-month (%) |
 
 ---
 
-## Sample Queries
+## ตัวอย่าง Query
 
-### Verify star schema referential integrity
+### ตรวจสอบ FK integrity ของ Star Schema
 
 ```sql
--- FK match rate: dim_artist
+-- อัตราการ match ของ dim_artist
 SELECT
-    COUNT(*)                                        AS fact_rows,
-    COUNT(da.artist_id)                             AS matched_artist,
+    COUNT(*)                                          AS fact_rows,
+    COUNT(da.artist_id)                               AS matched_artist,
     ROUND(COUNT(da.artist_id) * 100.0 / COUNT(*), 2) AS match_pct
 FROM spotify.fact_streams fs
 LEFT JOIN spotify.dim_artist da ON fs.artist_id = da.artist_id;
 
--- Expected: match_pct = 100.00
+-- คาดหวัง: match_pct = 100.00
 ```
 
-### Query star schema with dim/fact join
+### Query ข้ามตาราง dim และ fact
 
 ```sql
 SELECT
@@ -351,7 +365,7 @@ ORDER BY fs.stream_count DESC
 LIMIT 10;
 ```
 
-### Top 5 artists per day (Gold layer)
+### Top 5 ศิลปินรายวัน (Gold layer)
 
 ```sql
 SELECT
@@ -367,7 +381,7 @@ ORDER BY release_date DESC, rank_by_streams
 LIMIT 25;
 ```
 
-### Genre MoM growth trend (Gold layer)
+### แนวโน้ม MoM growth ของแนวเพลง (Gold layer)
 
 ```sql
 SELECT
@@ -381,84 +395,76 @@ ORDER BY release_month DESC, total_streams DESC
 LIMIT 20;
 ```
 
-### Count by layer (row count verification)
+### นับแถวแต่ละ layer เพื่อยืนยันผลลัพธ์
 
 ```sql
-SELECT 'stg_spotify_tracks' AS table_name, COUNT(*) AS rows FROM spotify.stg_spotify_tracks
+SELECT 'stg_spotify_tracks'  AS table_name, COUNT(*) AS rows FROM spotify.stg_spotify_tracks
 UNION ALL
-SELECT 'dim_artist',          COUNT(*) FROM spotify.dim_artist
+SELECT 'dim_artist',           COUNT(*) FROM spotify.dim_artist
 UNION ALL
-SELECT 'dim_album',           COUNT(*) FROM spotify.dim_album
+SELECT 'dim_album',            COUNT(*) FROM spotify.dim_album
 UNION ALL
-SELECT 'fact_streams',        COUNT(*) FROM spotify.fact_streams
+SELECT 'fact_streams',         COUNT(*) FROM spotify.fact_streams
 UNION ALL
-SELECT 'daily_top_artists',   COUNT(*) FROM spotify_marts.daily_top_artists
+SELECT 'daily_top_artists',    COUNT(*) FROM spotify_marts.daily_top_artists
 UNION ALL
-SELECT 'monthly_genre_trends',COUNT(*) FROM spotify_marts.monthly_genre_trends;
+SELECT 'monthly_genre_trends', COUNT(*) FROM spotify_marts.monthly_genre_trends;
 ```
 
-Run queries in terminal:
+รัน query ผ่าน terminal:
 ```bash
-docker exec spotify_postgres psql -U airflow -d airflow -c "<query here>"
+docker exec spotify_postgres psql -U airflow -d airflow -c "<query>"
 ```
 
 ---
 
-## How to Run
+## วิธีรัน
 
-### Prerequisites
+### ความต้องการเบื้องต้น
 
-- Docker Desktop with WSL2 backend
+- Docker Desktop พร้อม WSL2 backend
 
-### Start the stack
+### เริ่ม stack
 
 ```bash
 docker-compose up -d --build
 ```
 
-Wait approximately 60 seconds for `airflow-init` to complete DB migration and create the admin user.
+รอประมาณ 60 วินาทีให้ `airflow-init` ทำ DB migration และสร้าง admin user
 
-### Drop the source file
+### วางไฟล์ข้อมูล
 
 ```bash
-# Place the CSV in the landing zone
 cp /path/to/spotify_2015_2025_85k.csv data/raw_data/
 ```
 
-### Trigger the DAG
+### เปิด DAG
 
-Open `http://localhost:8080`, log in as `admin / admin`, navigate to `spotify_daily_etl_pipeline`, and click Trigger.
+เข้า `http://localhost:8080` login ด้วย `admin / admin` ไปที่ `spotify_daily_etl_pipeline` แล้วกด Trigger
 
-Alternatively via CLI:
+หรือใช้ CLI:
 ```bash
 docker exec spotify_airflow_web airflow dags trigger spotify_daily_etl_pipeline
 ```
 
-### Check results
-
-```bash
-docker exec spotify_postgres psql -U airflow -d airflow -c \
-  "SELECT COUNT(*) FROM spotify.fact_streams;"
-```
-
 ---
 
-## Project Structure
+## โครงสร้างโปรเจกต์
 
 ```
 ETL_SPOTIFY/
 ├── dags/
-│   └── spotify_etl_dag.py              Main DAG — all 6 tasks
+│   └── spotify_etl_dag.py              DAG หลัก — ทั้ง 6 task
 ├── dbt_spotify/
 │   ├── dbt_project.yml
-│   ├── profiles.yml                    DB connection (local dev credentials)
-│   ├── packages.yml                    dbt_utils dependency
+│   ├── profiles.yml                    การเชื่อมต่อ DB (สำหรับ local dev)
+│   ├── packages.yml                    dependency: dbt_utils
 │   ├── macros/
-│   │   └── generate_schema_name.sql    Overrides default dbt schema naming
+│   │   └── generate_schema_name.sql    override การตั้งชื่อ schema ของ dbt
 │   └── models/
 │       ├── staging/
-│       │   ├── sources.yml             Declares stg_spotify_tracks as dbt source
-│       │   └── stg_tracks_typed.sql    Typed view over staging table
+│       │   ├── sources.yml             ประกาศ stg_spotify_tracks เป็น dbt source
+│       │   └── stg_tracks_typed.sql    view ที่ cast type และเพิ่ม derived columns
 │       ├── dimensions/
 │       │   ├── dim_artist.sql
 │       │   └── dim_album.sql
@@ -468,32 +474,32 @@ ETL_SPOTIFY/
 │           ├── daily_top_artists.sql
 │           └── monthly_genre_trends.sql
 ├── data/
-│   ├── raw_data/                       Landing zone — place source CSV here
-│   ├── cleansed/                       Temp bronze file (deleted post-run)
-│   ├── rejected/                       DLQ — invalid rows kept for review
-│   └── archive/                        Processed source files (immutable)
+│   ├── raw_data/                       โซนรับไฟล์ — วางไฟล์ CSV ที่นี่
+│   ├── cleansed/                       Bronze ชั่วคราว (ถูกลบหลัง run)
+│   ├── rejected/                       DLQ — แถวที่ไม่ผ่านการตรวจสอบ
+│   └── archive/                        ไฟล์ที่ประมวลผลแล้ว (ถาวร)
 ├── scripts/
-│   └── entrypoint.sh                   Airflow init: db migrate + admin user
-├── Dockerfile                          Extends airflow:2.8.1 with dbt + providers
-├── docker-compose.yml                  Postgres + Airflow + pgAdmin stack
-└── pgadmin_servers.json                Pre-configured pgAdmin server connection
+│   └── entrypoint.sh                   Airflow init: db migrate + สร้าง admin user
+├── Dockerfile                          ต่อยอดจาก airflow:2.8.1 ติดตั้ง dbt + providers
+├── docker-compose.yml                  stack: Postgres + Airflow + pgAdmin
+└── pgadmin_servers.json                การตั้งค่า pgAdmin server สำเร็จรูป
 ```
 
 ---
 
-## Git — What Is and Is Not Committed
+## ไฟล์ที่ commit และไม่ commit ขึ้น Git
 
-| Path | Committed | Reason |
+| Path | Commit | เหตุผล |
 |---|---|---|
-| `dags/`, `dbt_spotify/models/`, `dbt_spotify/macros/` | Yes | Source code |
-| `Dockerfile`, `docker-compose.yml` | Yes | Infrastructure as code |
-| `dbt_spotify/dbt_project.yml`, `packages.yml`, `profiles.yml` | Yes | dbt config (local dev credentials only) |
-| `pgadmin_servers.json` | Yes | Local dev server config |
-| `data/raw_data/*.csv` | No | Large data file — supply separately |
-| `data/archive/*.csv`, `data/rejected/*.csv` | No | Generated outputs |
-| `dbt_spotify/dbt_packages/` | No | Installed via `dbt deps` (like node_modules) |
-| `dbt_spotify/target/` | No | dbt compiled artifacts |
-| `.venv/` | No | Python virtual environment |
-| `.claude/` | No | Editor session files |
+| `dags/`, `dbt_spotify/models/`, `dbt_spotify/macros/` | ขึ้น | source code หลัก |
+| `Dockerfile`, `docker-compose.yml` | ขึ้น | infrastructure as code |
+| `dbt_spotify/dbt_project.yml`, `packages.yml`, `profiles.yml` | ขึ้น | config dbt (credential สำหรับ local dev เท่านั้น) |
+| `pgadmin_servers.json` | ขึ้น | config server สำหรับ local dev |
+| `data/raw_data/*.csv` | ไม่ขึ้น | ไฟล์ข้อมูลขนาดใหญ่ — แจกจ่ายแยกต่างหาก |
+| `data/archive/*.csv`, `data/rejected/*.csv` | ไม่ขึ้น | output ที่ pipeline สร้าง |
+| `dbt_spotify/dbt_packages/` | ไม่ขึ้น | ติดตั้งผ่าน `dbt deps` (เหมือน node_modules) |
+| `dbt_spotify/target/` | ไม่ขึ้น | compiled artifacts ของ dbt |
+| `.venv/` | ไม่ขึ้น | Python virtual environment |
+| `.claude/` | ไม่ขึ้น | session files ของ editor |
 
-Note: `profiles.yml` contains a plaintext password for the local PostgreSQL instance. This is acceptable for a local Docker development environment where the same credentials appear in `docker-compose.yml`. Do not use production credentials in this file.
+หมายเหตุ: `profiles.yml` มี password แบบ plaintext สำหรับ PostgreSQL ใน local Docker environment ซึ่งยอมรับได้เนื่องจาก credential เดียวกันปรากฏใน `docker-compose.yml` อยู่แล้ว ห้ามใช้ production credential ในไฟล์นี้
